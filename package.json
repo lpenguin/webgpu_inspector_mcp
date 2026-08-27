@@ -5,10 +5,12 @@
   "type": "module",
   "main": "index.js",
   "bin": {
-    "webgpu-inspector-mcp": "./index.js"
+    "webgpu-inspector-mcp": "./index.js",
+    "mcp-call": "./bin/mcp-call.js"
   },
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "test": "node test/run-tests.js && node test/test-shader-debug-session.js && node test/test-stage-adapters.js && node test/test-mcp-tools.js && node test/test-e2e-shader-debugging.js"
   },
   "keywords": [
     "webgpu",
@@ -19,6 +21,7 @@
   "author": "Brendan Duncan",
   "license": "MIT",
   "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
     "webgpu_inspector": "github:brendan-duncan/webgpu_inspector#f9c73368637bb2b0bff5faaa00ff28981eb2c3fa"
   }
 }

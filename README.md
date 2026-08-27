@@ -2,13 +2,13 @@
 
 An OpenCode / Model Context Protocol (MCP) server for [WebGPU Inspector](https://github.com/brendan-duncan/webgpu_inspector).
 
-It allows AI assistants to drive Chrome/Chromium to capture live WebGPU frames, profile frame performance, inspect WGSL shaders, buffers, textures, and diagnose WebGPU rendering issues.
+It allows AI assistants to drive Chrome/Chromium to capture live WebGPU frames, profile frame performance, inspect WGSL shaders, buffers, textures, diagnose WebGPU rendering issues, and step-debug WGSL compute, vertex, and fragment shaders interactively.
 
 ## Features
 
 - **Automated Browser Instrumentation**: Launches Chromium/Chrome/Edge via CDP and injects WebGPU Inspector into every page before page scripts run.
-- **21 MCP Tools**: Tools for browser control, frame capture, GPU timestamp profiling, live buffer/texture reads, draw state diffing, and shader inspection.
-- **Capture File Analysis**: Load and inspect `.wgpuc` binary files or `.json` recordings without running a browser.
+- **Interactive Shader Debugging (8 Tools)**: Step-by-step WGSL debugging for compute, vertex, and fragment shaders with breakpoints, variable inspection, callstack unwinding, and expression evaluation.
+- **Capture File Analysis & Live Inspection (21 Tools)**: Tools for browser control, frame capture, GPU timestamp profiling, live buffer/texture reads, draw state diffing, and shader inspection. Load and inspect `.wgpuc` binary files or `.json` recordings without running a browser.
 
 ## Installation
 
@@ -37,6 +37,55 @@ Add the server to your `opencode.json` (or Claude desktop configuration):
   }
 }
 ```
+
+## Shader Debugging Tools
+
+The server provides 8 dedicated tools for interactive shader debugging powered by `wgsl_reflect`:
+
+| Tool | Description | Key Parameters |
+| --- | --- | --- |
+| `shader_debug_start` | Starts an interactive debugging session for a compute dispatch, vertex draw, or fragment pixel. | `captureId`, `commandIndex`, `stage` (`"compute"`, `"vertex"`, `"fragment"`), `entryPoint`, `code`, `invocation`, `breakpoints`, `constants`, `sessionId` |
+| `shader_debug_step` | Advances shader execution by stepping lines or instructions. | `sessionId`, `action` (`"step_next"`, `"step_into"`, `"step_over"`, `"step_out"`), `count` |
+| `shader_debug_continue` | Continues execution until a line breakpoint is hit, the shader finishes, or `maxSteps` is reached. | `sessionId`, `maxSteps` (default: 50000) |
+| `shader_debug_set_breakpoints` | Sets, removes, or clears line breakpoints in the active session. | `sessionId`, `add` (array of line numbers), `remove` (array of line numbers), `clearAll` (boolean) |
+| `shader_debug_get_stack` | Returns the current callstack / call frames (innermost frame first) with function names and line numbers. | `sessionId` |
+| `shader_debug_get_variables` | Inspects variables categorized by scope (`locals`, `inputs`, `globals`, `constants`, `resources`). | `sessionId`, `scope` (`"all"`, `"locals"`, `"inputs"`, `"globals"`, `"constants"`, `"resources"`), `filter`, `maxDepth` |
+| `shader_debug_eval` | Evaluates path expressions (e.g. `in.position.x`, `uFrame.cameraPos.xyz`, `params.multiplier`, `matrix[1][2]`). | `sessionId`, `expression` (or `path`) |
+| `shader_debug_stop` | Stops and disposes an active debug session, freeing associated resources. | `sessionId` |
+
+### Invocation Coordinates by Stage
+
+When starting a debug session with `shader_debug_start`, provide the target invocation:
+
+- **Compute**: `{ "threadId": [x, y, z] }` or `{ "dispatchId": [x, y, z] }`
+- **Vertex**: `{ "vertexIndex": 0, "instanceIndex": 0 }` (fetches vertex buffer attributes automatically)
+- **Fragment**: `{ "pixelX": 100, "pixelY": 100 }` (interpolates vertex outputs / varyings and `@builtin(position)` at pixel center)
+
+## Base Inspection & Profiling Tools (21 Tools)
+
+| Tool | Description |
+| --- | --- |
+| `launch_browser` | Launch a new instrumented Chrome/Edge instance via CDP. |
+| `attach_browser` | Attach to an already-running Chrome/Edge on a remote debugging port. |
+| `open_page` | Open a new instrumented tab in the controlled browser. |
+| `browser_status` | Check browser connection and instrumented pages status. |
+| `list_pages` | List connected WebGPU pages. |
+| `screenshot_page` | Capture a composited PNG screenshot of the presented canvas/page. |
+| `capture_frames` | Request frame capture from connected page with optional GPU profiling. |
+| `list_captures` | List captures currently loaded in the store. |
+| `load_capture_file` | Load a `.wgpuc` or `.json` capture file from disk. |
+| `get_capture_summary` | Get high-level summary of passes, draw calls, objects, and validation errors. |
+| `analyze_performance` | Profile GPU duration per pass and diagnose bottlenecks (fillrate vs ALU). |
+| `get_commands` | Return paginated list of GPU commands in capture. |
+| `get_object` | Inspect GPU object descriptor (buffers, textures, pipelines). |
+| `get_shader` | Retrieve WGSL source code of a ShaderModule. |
+| `get_validation_errors` | Get WebGPU validation errors recorded during capture. |
+| `get_draw_state` | Resolve pipeline, bound vertex buffers, index buffers, and bind groups for a draw/dispatch. |
+| `decode_vertex_buffer` | Decode captured vertex buffer payloads into typed attribute values. |
+| `diff_draws` | Structurally diff the state between two draw calls. |
+| `read_buffer` | Read live GPU buffer contents from connected page. |
+| `read_texture` | Read live GPU texture / render target region and return statistics and ASCII view. |
+| `get_frame_stats` | Sample live frame rate, frame time variance, and CPU submit cost. |
 
 ## Environment Variables
 
