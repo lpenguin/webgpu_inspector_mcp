@@ -1,8 +1,77 @@
 import {
   WgslDebug,
   WgslReflect,
-  WgslExec
+  WgslExec,
+  createFragmentQuadDebugger
 } from "wgsl_reflect/wgsl_reflect.module.js";
+import { QuadDebuggerAdapter } from "webgpu_inspector/src/devtools/quad_debugger_adapter.js";
+
+// Ensure QuadDebuggerAdapter satisfies ShaderDebugSession interface
+if (!Object.getOwnPropertyDescriptor(QuadDebuggerAdapter.prototype, "currentLine")) {
+  Object.defineProperty(QuadDebuggerAdapter.prototype, "currentLine", {
+    get() {
+      return this.scheduler?.targetLine ?? this.currentCommand?.line ?? -1;
+    }
+  });
+}
+if (!Object.getOwnPropertyDescriptor(QuadDebuggerAdapter.prototype, "breakpoints")) {
+  Object.defineProperty(QuadDebuggerAdapter.prototype, "breakpoints", {
+    get() {
+      return this.scheduler?.breakpoints;
+    }
+  });
+}
+if (!Object.getOwnPropertyDescriptor(QuadDebuggerAdapter.prototype, "exec")) {
+  Object.defineProperty(QuadDebuggerAdapter.prototype, "exec", {
+    get() {
+      return this.scheduler?.exec;
+    }
+  });
+}
+if (!Object.getOwnPropertyDescriptor(QuadDebuggerAdapter.prototype, "returnValue")) {
+  Object.defineProperty(QuadDebuggerAdapter.prototype, "returnValue", {
+    get() {
+      return this.scheduler?.targetOutput;
+    }
+  });
+}
+if (!Object.getOwnPropertyDescriptor(QuadDebuggerAdapter.prototype, "discarded")) {
+  Object.defineProperty(QuadDebuggerAdapter.prototype, "discarded", {
+    get() {
+      return Boolean(this.scheduler?.targetDiscarded);
+    }
+  });
+}
+if (!Object.getOwnPropertyDescriptor(QuadDebuggerAdapter.prototype, "_execStack")) {
+  Object.defineProperty(QuadDebuggerAdapter.prototype, "_execStack", {
+    get() {
+      return this.scheduler?._lanes?.[this.scheduler.targetLane]?.stack;
+    }
+  });
+}
+if (!QuadDebuggerAdapter.prototype.getReturnValue) {
+  QuadDebuggerAdapter.prototype.getReturnValue = function () {
+    return this.scheduler?.targetOutput;
+  };
+}
+if (!QuadDebuggerAdapter.prototype.clearBreakpoints) {
+  QuadDebuggerAdapter.prototype.clearBreakpoints = function () {
+    this.scheduler?.breakpoints?.clear();
+  };
+}
+if (!QuadDebuggerAdapter.prototype.stepNext) {
+  QuadDebuggerAdapter.prototype.stepNext = function (into = true) {
+    if (into) {
+      this.stepInto();
+    } else {
+      this.stepOver();
+    }
+    return !this.isAtEnd;
+  };
+}
+if (!QuadDebuggerAdapter.prototype.reset) {
+  QuadDebuggerAdapter.prototype.reset = function () {};
+}
 
 /**
  * Decode half-precision float (f16) from uint16.
@@ -202,6 +271,17 @@ export function formatDataValue(val, maxDepth = 4) {
   // VectorData / MatrixData with typed array .data
   try {
     if (val.data && val.data.length !== undefined) {
+      const typeName = val.typeInfo?.name || val.typeInfo?.getTypeName?.() || "";
+      const isScalar =
+        val.isScalar ||
+        val.typeInfo?.isScalar ||
+        ["u32", "i32", "f32", "f16", "bool"].includes(typeName);
+      if (val.data.length === 1 && isScalar) {
+        if (typeName === "bool") {
+          return Boolean(val.data[0]);
+        }
+        return val.data[0];
+      }
       return Array.from(val.data);
     }
   } catch {}
@@ -354,12 +434,41 @@ export class ShaderDebugSession {
       );
     } else if (this.stage === "fragment") {
       const stageInputs = this._normalizeFragmentInputs(this.invocation, this.stageConfig);
-      success = this.debugger.debugFragment(
-        this.entryPoint,
-        stageInputs,
-        this.bindGroups,
-        config
-      );
+      const quadInputs =
+        this.stageConfig?.quadInputs ||
+        this.invocation?.quadInputs ||
+        stageInputs?.quadInputs;
+      const targetLane =
+        this.stageConfig?.targetLane ??
+        this.invocation?.targetLane ??
+        stageInputs?.targetLane ??
+        0;
+
+      if (quadInputs && Array.isArray(quadInputs) && quadInputs.length === 4) {
+        try {
+          const { scheduler, errors } = createFragmentQuadDebugger(
+            this.code,
+            this.entryPoint,
+            quadInputs,
+            this.bindGroups,
+            targetLane,
+            config.options || config
+          );
+          if (scheduler) {
+            this.debugger = new QuadDebuggerAdapter(scheduler);
+            success = true;
+          }
+        } catch (e) {}
+      }
+
+      if (!success) {
+        success = this.debugger.debugFragment(
+          this.entryPoint,
+          stageInputs,
+          this.bindGroups,
+          config
+        );
+      }
     }
 
     if (!success) {
@@ -414,9 +523,32 @@ export class ShaderDebugSession {
     const fnInfo = this.reflect.getFunctionInfo(this.entryPoint);
     if (fnInfo?.inputs) {
       for (const inp of fnInfo.inputs) {
-        if (raw[inp.name] !== undefined) {
-          inputs[inp.location] = raw[inp.name];
-          inputs[String(inp.location)] = raw[inp.name];
+        const val = raw[inp.location] ?? raw[String(inp.location)] ?? raw[inp.name];
+        if (val !== undefined) {
+          inputs[inp.location] = val;
+          inputs[String(inp.location)] = val;
+          inputs[inp.name] = val;
+        }
+      }
+    }
+
+    if (fnInfo?.arguments) {
+      for (const arg of fnInfo.arguments) {
+        if (arg.type?.members) {
+          for (const m of arg.type.members) {
+            const locAttr = m.attributes?.find((a) => a.name === "location");
+            if (locAttr && locAttr.value !== undefined) {
+              const loc = Number(locAttr.value);
+              const val = raw[loc] ?? raw[String(loc)] ?? raw[m.name];
+              if (val !== undefined) {
+                inputs[loc] = val;
+                inputs[String(loc)] = val;
+                inputs[m.name] = val;
+              }
+            } else if (raw[m.name] !== undefined) {
+              inputs[m.name] = raw[m.name];
+            }
+          }
         }
       }
     }
@@ -428,7 +560,7 @@ export class ShaderDebugSession {
       inputs.sample_mask = raw.sampleMask;
     }
     if (raw.frontFacing !== undefined) {
-      inputs.front_facing = raw.frontFacing;
+      inputs.front_facing = raw.frontFacing ? 1 : 0;
     }
 
     if (inputs.position === undefined && (raw.x !== undefined || raw.y !== undefined)) {
@@ -442,6 +574,9 @@ export class ShaderDebugSession {
   }
 
   get isAtEnd() {
+    if (this.debugger?.scheduler) {
+      return this.debugger.scheduler.isDone;
+    }
     return !this.debugger.currentState || this.debugger.currentState.isAtEnd;
   }
 

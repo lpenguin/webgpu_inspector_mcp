@@ -541,7 +541,140 @@ test("Multi-invocation debugging: parallel debug sessions on vertices #0 and #2 
 });
 
 // ---------------------------------------------------------------------------
-// 5. Error handling and resource isolation
+// 5. Full Debug Workflow on Real WoodWorks Capture: Fragment Debug on Pixel (782, 487)
+// ---------------------------------------------------------------------------
+test("Full E2E debug workflow on real WoodWorks capture: fragment rasterization at pixel (782, 487) resolves non-zero fragment.localPosition", async () => {
+  const capturePath = await findWoodWorksCapturePath();
+  if (!capturePath) {
+    console.log("    (Skipping real WoodWorks fragment test: capture file not found)");
+    return;
+  }
+
+  const harness = await createTestClient();
+  try {
+    const loadRes = await harness.callToolJson("load_capture_file", { path: capturePath });
+    const captureId = loadRes.captureId;
+
+    const woodShaderCode = `
+      struct SparseUniforms {
+        boundsMinVoxel: vec4f,
+        volumeMin: vec4f,
+        volumeMax: vec4f,
+        coarseBrick: vec4u,
+        gridPadding: vec4u,
+        atlasGrid: vec4u,
+        slotTrace: vec4u,
+        trace: vec4f,
+        debug: vec4u,
+      };
+
+      @group(1) @binding(0) var<uniform> sparse: SparseUniforms;
+
+      struct FrameUniforms {
+        viewProjection: mat4x4f,
+        model: mat4x4f,
+        inverseModel: mat4x4f,
+        cameraWorld: vec4f,
+      };
+
+      @group(0) @binding(0) var<uniform> frame: FrameUniforms;
+
+      struct woodVertex_Output {
+        @builtin(position) clipPosition: vec4f,
+        @location(0) localPosition: vec3f,
+        @location(1) worldPosition: vec3f,
+      };
+
+      @vertex fn woodVertex(@location(0) unitPosition: vec3f) -> woodVertex_Output {
+        let localPosition = mix(sparse.volumeMin.xyz, sparse.volumeMax.xyz, unitPosition);
+        let world = (frame.model * vec4f(localPosition, 1.0));
+        return woodVertex_Output((frame.viewProjection * world), localPosition, world.xyz);
+      }
+
+      @group(1) @binding(1) var<storage, read> pageTable: array<u32>;
+      @group(1) @binding(2) var sdfTexture: texture_3d<f32>;
+
+      struct woodFragment_Input {
+        @location(0) localPosition: vec3f,
+        @location(1) worldPosition: vec3f,
+      };
+
+      @fragment fn woodFragment(_arg_0: woodFragment_Input) -> @location(0) vec4f {
+        let localPos = _arg_0.localPosition;
+        let worldPos = _arg_0.worldPosition;
+        let sparseMin = sparse.volumeMin.xyz;
+        let pt0 = pageTable[0];
+        return vec4f(localPos + sparseMin, f32(pt0));
+      }
+    `;
+
+    const startRes = await harness.callToolJson("shader_debug_start", {
+      captureId,
+      commandIndex: 17,
+      stage: "fragment",
+      entryPoint: "woodFragment",
+      code: woodShaderCode,
+      invocation: { pixelX: 782, pixelY: 487 }
+    });
+
+    assert(startRes.sessionId, "Must return valid sessionId");
+    assert.equal(startRes.stage, "fragment");
+    assert.equal(startRes.entryPoint, "woodFragment");
+    assert.equal(startRes.status, "paused");
+
+    const sessionId = startRes.sessionId;
+
+    // 1. Verify Group 1 sparse uniforms and pageTable storage resolution
+    const globalsRes = await harness.callToolJson("shader_debug_get_variables", {
+      sessionId,
+      scope: "globals"
+    });
+    assert(globalsRes.globals?.sparse, "sparse uniforms must be populated");
+    assert.equal(Number(globalsRes.globals.sparse.volumeMin[0].toFixed(3)), -0.052);
+    assert.equal(Number(globalsRes.globals.sparse.volumeMax[0].toFixed(3)), 0.052);
+    assert(globalsRes.globals.pageTable?.length > 0, "pageTable storage must be populated");
+
+    // 2. Verify rasterized vertex inputs for fragment debugging at (782, 487)
+    const inputsRes = await harness.callToolJson("shader_debug_get_variables", {
+      sessionId,
+      scope: "inputs"
+    });
+    const localPos =
+      inputsRes.inputs._arg_0?.localPosition ||
+      inputsRes.inputs.localPosition ||
+      inputsRes.inputs["0"];
+    assert(localPos, "localPosition must be present in inputs");
+    assert(
+      Math.abs(localPos[0]) > 0.001 || Math.abs(localPos[1]) > 0.001 || Math.abs(localPos[2]) > 0.001,
+      `localPosition must be non-zero from vertex interpolation, got ${JSON.stringify(localPos)}`
+    );
+
+    // 3. Evaluate expression
+    const evalRes = await harness.callToolJson("shader_debug_eval", {
+      sessionId,
+      expression: "_arg_0.localPosition"
+    });
+    assert.equal(evalRes.success, true);
+    assert.deepEqual(evalRes.value, localPos);
+
+    // 4. Step through execution
+    const stepRes = await harness.callToolJson("shader_debug_step", {
+      sessionId,
+      action: "step_next",
+      count: 2
+    });
+    assert(stepRes.currentLine > 0);
+
+    // 5. Clean stop
+    const stopRes = await harness.callToolJson("shader_debug_stop", { sessionId });
+    assert.equal(stopRes.disposed, true);
+  } finally {
+    await harness.close();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 6. Error handling and resource isolation
 // ---------------------------------------------------------------------------
 test("Error handling: invalid expressions, expired sessions, and missing identifiers", async () => {
   const harness = await createTestClient();

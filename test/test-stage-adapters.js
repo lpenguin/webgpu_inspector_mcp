@@ -573,7 +573,7 @@ test("prepareShaderDebugSession on fragment draw with pixel coordinates and text
   assert(colRet, "Fragment shader should return sampled color");
   assert.deepEqual(Array.from(colRet), [1, 0, 0, 1]); // Red
 
-  // Test fragment quad inputs generation
+  // Test fragment quad inputs generation (aligned to 2x2 even pixel boundaries)
   const quadInputs = buildFragmentQuadInputs({
     capture,
     pipeline: capture.objects["3"],
@@ -585,17 +585,118 @@ test("prepareShaderDebugSession on fragment draw with pixel coordinates and text
 
   assert.equal(quadInputs.length, 4);
   assert.equal(quadInputs[0].position[0], 100.5);
-  assert.equal(quadInputs[0].position[1], 75.5);
+  assert.equal(quadInputs[0].position[1], 74.5);
   assert.equal(quadInputs[1].position[0], 101.5);
-  assert.equal(quadInputs[1].position[1], 75.5);
+  assert.equal(quadInputs[1].position[1], 74.5);
   assert.equal(quadInputs[2].position[0], 100.5);
-  assert.equal(quadInputs[2].position[1], 76.5);
+  assert.equal(quadInputs[2].position[1], 75.5);
   assert.equal(quadInputs[3].position[0], 101.5);
-  assert.equal(quadInputs[3].position[1], 76.5);
+  assert.equal(quadInputs[3].position[1], 75.5);
 });
 
 // ---------------------------------------------------------------------------
-// 5. Missing resource error reporting
+// 5. Group 1 sparse uniforms and pageTable storage buffer resolution from bufferData
+// ---------------------------------------------------------------------------
+test("Group 1 sparse uniforms and pageTable storage buffer resolution from bufferData", async () => {
+  const sparseUniformBytes = new Float32Array([
+    -0.064, -0.064, -0.064, 0.00025, // boundsMinVoxel
+    -0.052, -0.020, -0.034, 0.0,     // volumeMin
+    0.052,  0.020,  0.034,  0.0,     // volumeMax
+    8, 8, 8, 4                       // coarseBrick (as uint32 in same buffer)
+  ]);
+
+  const pageTableData = new Uint32Array([0, 1, 2, 3, 10, 20, 30, 40]);
+
+  const capture = {
+    objects: {
+      "1": {
+        id: 1,
+        type: "ShaderModule",
+        descriptor: {
+          code: `
+            struct SparseUniforms {
+              boundsMinVoxel: vec4f,
+              volumeMin: vec4f,
+              volumeMax: vec4f,
+              coarseBrick: vec4u,
+            };
+            @group(1) @binding(0) var<uniform> sparse: SparseUniforms;
+            @group(1) @binding(1) var<storage, read> pageTable: array<u32>;
+            @compute @workgroup_size(1)
+            fn main() {
+              let minX = sparse.volumeMin.x;
+              let pt0 = pageTable[0];
+            }
+          `
+        }
+      },
+      "2": {
+        id: 2,
+        type: "ComputePipeline",
+        descriptor: {
+          compute: { module: { __id: 1 }, entryPoint: "main" }
+        }
+      },
+      "60": { id: 60, type: "Buffer", size: pageTableData.byteLength },
+      "63": { id: 63, type: "Buffer", size: sparseUniformBytes.byteLength },
+      "66": {
+        id: 66,
+        type: "BindGroup",
+        descriptor: {
+          entries: [
+            { binding: 0, resource: { buffer: { __id: 63 } } },
+            { binding: 1, resource: { buffer: { __id: 60 } } }
+          ]
+        }
+      }
+    },
+    commands: [
+      { method: "beginComputePass", object: "enc", result: "enc" },
+      { method: "setPipeline", object: "enc", args: [{ __id: 2 }] },
+      {
+        method: "setBindGroup",
+        object: "enc",
+        args: [1, { __id: 66 }],
+        bufferData: [
+          { entryIndex: 0, __payloadId: 9, byteLength: sparseUniformBytes.byteLength },
+          { entryIndex: 1, __payloadId: 10, byteLength: pageTableData.byteLength }
+        ]
+      },
+      { method: "dispatchWorkgroups", object: "enc", args: [1, 1, 1] }
+    ]
+  };
+
+  const payloadResolver = (id) => {
+    if (id === 9) return sparseUniformBytes.buffer;
+    if (id === 10) return pageTableData.buffer;
+    return null;
+  };
+
+  const passState = resolvePassState(capture, 3);
+  assert(passState.bindGroups[0].bufferData, "PassState must capture bufferData on setBindGroup");
+
+  const sessionBindGroups = buildSessionBindGroups(capture, passState.bindGroups, payloadResolver);
+  assert(sessionBindGroups[1][0].buffer, "Group 1 binding 0 must have buffer");
+  assert(sessionBindGroups[1][0].uniform, "Group 1 binding 0 must have uniform");
+  assert(sessionBindGroups[1][1].storage, "Group 1 binding 1 must have storage");
+
+  const session = prepareShaderDebugSession({
+    capture,
+    commandIndex: 3,
+    stage: "compute",
+    entryPoint: "main",
+    payloadResolver
+  });
+
+  const globals = session.getVariables({ scope: "globals" }).globals;
+  assert(globals.sparse, "sparse uniforms must be populated");
+  assert.equal(Number(globals.sparse.volumeMin[0].toFixed(3)), -0.052);
+  assert.equal(Number(globals.sparse.volumeMax[0].toFixed(3)), 0.052);
+  assert.deepEqual(globals.pageTable.slice(0, 4), [0, 1, 2, 3]);
+});
+
+// ---------------------------------------------------------------------------
+// 6. Missing resource error reporting
 // ---------------------------------------------------------------------------
 test("Missing resource error reporting for invalid capture, missing pipeline, and missing code", async () => {
   // 1. Invalid capture

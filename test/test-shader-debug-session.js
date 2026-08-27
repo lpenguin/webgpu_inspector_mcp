@@ -515,6 +515,63 @@ fn fs_main(@location(0) uv: vec2f) -> @location(0) vec4f {
   );
 });
 
+test("Fragment quad debugging with struct inputs and QuadDebuggerAdapter", async () => {
+  const code = `
+    struct FragIn {
+      @location(0) localPosition: vec3f,
+      @location(1) worldPosition: vec3f,
+    };
+
+    @fragment
+    fn woodFragment(in: FragIn) -> @location(0) vec4f {
+      let x = in.localPosition.x;
+      let y = in.localPosition.y;
+      return vec4f(x, y, 0.5, 1.0);
+    }
+  `;
+
+  const quadInputs = [
+    { 0: [0.1, 0.2, 0.3], 1: [1.0, 2.0, 3.0], position: [0.5, 0.5, 0.5, 1], front_facing: 1, sample_index: 0 },
+    { 0: [0.2, 0.2, 0.3], 1: [1.0, 2.0, 3.0], position: [1.5, 0.5, 0.5, 1], front_facing: 1, sample_index: 0 },
+    { 0: [0.1, 0.3, 0.3], 1: [1.0, 2.0, 3.0], position: [0.5, 1.5, 0.5, 1], front_facing: 1, sample_index: 0 },
+    { 0: [0.2, 0.3, 0.3], 1: [1.0, 2.0, 3.0], position: [1.5, 1.5, 0.5, 1], front_facing: 1, sample_index: 0 }
+  ];
+
+  const session = new ShaderDebugSession({
+    code,
+    stage: "fragment",
+    entryPoint: "woodFragment",
+    stageConfig: { quadInputs, targetLane: 0 }
+  });
+
+  const snap = session.init();
+  assert.equal(snap.status, "paused");
+  assert.equal(snap.currentFunction, "woodFragment");
+
+  const inputs = session.getVariables({ scope: "inputs" }).inputs;
+  assert(inputs.in || inputs.localPosition || inputs["0"]);
+  if (inputs.in) {
+    assert.deepEqual(inputs.in.localPosition.map(v => Number(v.toFixed(1))), [0.1, 0.2, 0.3]);
+  }
+
+  const evalLocalPos = session.evaluate("in.localPosition");
+  assert.equal(evalLocalPos.success, true);
+  assert.deepEqual(evalLocalPos.value.map(v => Number(v.toFixed(1))), [0.1, 0.2, 0.3]);
+
+  session.continueExecution();
+  assert.equal(session.isAtEnd, true);
+  const ret = session.debugger.getReturnValue();
+  assert.deepEqual(Array.from(ret).map(v => Number(v.toFixed(1))), [0.1, 0.2, 0.5, 1.0]);
+});
+
+test("formatDataValue unwraps 1-element scalar data to scalar values", async () => {
+  assert.equal(formatDataValue({ data: new Uint32Array([42]), typeInfo: { name: "u32" } }), 42);
+  assert.equal(formatDataValue({ data: new Int32Array([-17]), typeInfo: { name: "i32" } }), -17);
+  assert.equal(formatDataValue({ data: new Float32Array([3.14]), typeInfo: { name: "f32" } }), Number(Math.fround(3.14)));
+  assert.equal(formatDataValue({ data: new Uint32Array([1]), typeInfo: { name: "bool" } }), true);
+  assert.equal(formatDataValue({ data: new Uint32Array([0]), typeInfo: { name: "bool" } }), false);
+});
+
 // ---------------------------------------------------------------------------
 // 7. Source Snippet generation
 // ---------------------------------------------------------------------------

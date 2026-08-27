@@ -6,6 +6,46 @@ import {
   ShaderDebugSession,
   decodeFloat16
 } from "./shader-debug-session.js";
+import {
+  assembleTriangles,
+  buildFragmentQuad,
+  buildQuadInputs,
+  clipTriangleToNearW,
+  projectVertex,
+  triangleArea,
+  barycentric,
+  perspectiveInterp,
+  W_CLIP_EPSILON
+} from "webgpu_inspector/src/devtools/fragment_debug.js";
+import {
+  fetchVertexInputs as upstreamFetchVertexInputs,
+  decodeVertexAttribute,
+  conformVertexInput
+} from "webgpu_inspector/src/devtools/vertex_fetcher.js";
+import {
+  makeVertexRunner,
+  extractVsOutput,
+  decodeIndexArray,
+  collectVertexBufferData
+} from "webgpu_inspector/src/devtools/stage_debug_utils.js";
+
+export {
+  assembleTriangles,
+  buildFragmentQuad,
+  buildQuadInputs,
+  clipTriangleToNearW,
+  projectVertex,
+  triangleArea,
+  barycentric,
+  perspectiveInterp,
+  W_CLIP_EPSILON,
+  decodeVertexAttribute,
+  conformVertexInput,
+  makeVertexRunner,
+  extractVsOutput,
+  decodeIndexArray,
+  collectVertexBufferData
+};
 
 /**
  * Standard WebGPU vertex attribute formats configuration.
@@ -119,7 +159,7 @@ export function toArrayBuffer(data) {
  */
 export function resolvePayloadBytes(ref, resolver, capture = null) {
   if (!ref) return null;
-  if (ref instanceof ArrayBuffer || ArrayBuffer.isView(ref) || Buffer.isBuffer(ref)) {
+  if (ref instanceof ArrayBuffer || ArrayBuffer.isView(ref) || (typeof Buffer !== "undefined" && Buffer.isBuffer(ref))) {
     return ref;
   }
 
@@ -309,8 +349,16 @@ export function buildSessionBindGroups(capture, bindGroupCommands = [], payloadR
     const entries = bgRec.descriptor?.entries || bgRec.entries || [];
     let dynamicOffsetIdx = 0;
 
-    for (const entry of entries) {
-      const binding = entry.binding !== undefined ? Number(entry.binding) : 0;
+    const bgBufferData =
+      bgCmd.bufferData ||
+      (bgCmd.commandIndex !== undefined
+        ? capture?.commands?.[bgCmd.commandIndex]?.bufferData ||
+          capture?.metadata?.commands?.[bgCmd.commandIndex]?.bufferData
+        : null);
+
+    for (let i = 0; i < entries.length; i++) {
+      const entry = entries[i];
+      const binding = entry.binding !== undefined ? Number(entry.binding) : i;
 
       // 1. Buffer Resource
       const isBuffer =
@@ -330,7 +378,35 @@ export function buildSessionBindGroups(capture, bindGroupCommands = [], payloadR
           offset += Number(dynamicOffsets[dynamicOffsetIdx++]) || 0;
         }
 
-        const rawBuf = resolveBufferData(bufId, bufRec, entry, capture, payloadResolver);
+        let rawBuf = null;
+
+        // Check if bgBufferData has a matching payload item
+        if (bgBufferData) {
+          let match = null;
+          if (Array.isArray(bgBufferData)) {
+            match = bgBufferData.find(
+              (item) =>
+                item &&
+                (item.entryIndex === i ||
+                  item.entryIndex === binding ||
+                  item.binding === binding ||
+                  item.binding === i)
+            );
+            if (!match && bgBufferData[i] !== undefined) {
+              match = bgBufferData[i];
+            }
+          } else if (typeof bgBufferData === "object") {
+            match = bgBufferData[binding] ?? bgBufferData[i] ?? null;
+          }
+          if (match) {
+            rawBuf = resolvePayloadBytes(match, payloadResolver, capture);
+          }
+        }
+
+        if (!rawBuf) {
+          rawBuf = resolveBufferData(bufId, bufRec, entry, capture, payloadResolver);
+        }
+
         let arrayBuf = toArrayBuffer(rawBuf);
 
         if (bufRec?.size && arrayBuf.byteLength < bufRec.size) {
@@ -427,11 +503,13 @@ export function buildSessionBindGroups(capture, bindGroupCommands = [], payloadR
       }
 
       // Direct fallback
-      if (entry.uniform || entry.storage) {
-        const raw = entry.uniform || entry.storage;
+      if (entry.uniform || entry.storage || entry.buffer) {
+        const raw = entry.uniform || entry.storage || entry.buffer;
+        const buf = toArrayBuffer(raw);
         sessionBindGroups[groupIndex][binding] = {
-          uniform: toArrayBuffer(raw),
-          storage: toArrayBuffer(raw)
+          uniform: buf,
+          storage: buf,
+          buffer: buf
         };
       } else if (entry.texture && entry.descriptor) {
         sessionBindGroups[groupIndex][binding] = {
@@ -481,39 +559,6 @@ export function readScalar(view, offset, type, size) {
 }
 
 /**
- * Decodes a single vertex attribute according to its WebGPU format.
- */
-export function decodeVertexAttribute(view, offset, format) {
-  const fmt = VERTEX_FORMATS[format];
-  if (!fmt) return undefined;
-
-  if (fmt.type === "unorm10_10_10_2") {
-    if (offset + 4 > view.byteLength) return undefined;
-    const u32 = view.getUint32(offset, true);
-    return [
-      (u32 & 0x3ff) / 1023.0,
-      ((u32 >>> 10) & 0x3ff) / 1023.0,
-      ((u32 >>> 20) & 0x3ff) / 1023.0,
-      ((u32 >>> 30) & 0x3) / 3.0
-    ];
-  }
-
-  if (offset + fmt.count * fmt.byteSize > view.byteLength) {
-    return undefined;
-  }
-
-  if (fmt.count === 1) {
-    return readScalar(view, offset, fmt.type, fmt.byteSize);
-  }
-
-  const comps = [];
-  for (let c = 0; c < fmt.count; c++) {
-    comps.push(readScalar(view, offset + c * fmt.byteSize, fmt.type, fmt.byteSize));
-  }
-  return comps;
-}
-
-/**
  * Decodes vertex inputs for vertex shader execution.
  *
  * @param {Object} pipelineDesc - Pipeline descriptor with vertex.buffers
@@ -528,81 +573,51 @@ export function fetchVertexInputs(
   vertexBufferData = [],
   vertexIndex = 0,
   instanceIndex = 0,
-  shaderInputs = {}
+  shaderInputs = null
 ) {
-  const vIndex = Number(vertexIndex) || 0;
-  const instIndex = Number(instanceIndex) || 0;
-  const inputs = {
-    vertex_index: vIndex,
-    instance_index: instIndex,
-    vertexIndex: vIndex,
-    instanceIndex: instIndex,
-    ...shaderInputs
-  };
-
-  const bufferLayouts =
-    pipelineDesc?.vertex?.buffers ||
-    pipelineDesc?.buffers ||
-    (Array.isArray(pipelineDesc) ? pipelineDesc : []);
-
-  for (let slot = 0; slot < bufferLayouts.length; slot++) {
-    const layout = bufferLayouts[slot];
-    if (!layout || !Array.isArray(layout.attributes)) continue;
-
-    let rawBuf = null;
-    let boundOffset = 0;
-
-    if (Array.isArray(vertexBufferData)) {
-      const entry =
-        vertexBufferData.find((vb) => vb && (vb.slot === slot || vb.slot === String(slot))) ||
-        vertexBufferData[slot];
-      if (entry) {
-        if (entry.buffer) {
-          rawBuf = entry.buffer;
-          boundOffset = entry.offset || 0;
-        } else if (entry.bytes) {
-          rawBuf = entry.bytes;
-          boundOffset = entry.offset || 0;
-        } else {
-          rawBuf = entry;
-        }
-      }
-    } else if (vertexBufferData && typeof vertexBufferData === "object") {
-      const entry = vertexBufferData[slot] || vertexBufferData[String(slot)];
-      if (entry) {
-        if (entry.buffer) {
-          rawBuf = entry.buffer;
-          boundOffset = entry.offset || 0;
-        } else if (entry.bytes) {
-          rawBuf = entry.bytes;
-          boundOffset = entry.offset || 0;
-        } else {
-          rawBuf = entry;
-        }
-      }
+  let normalizedVb = [];
+  if (Array.isArray(vertexBufferData)) {
+    for (let slot = 0; slot < vertexBufferData.length; slot++) {
+      const item = vertexBufferData[slot];
+      if (!item) continue;
+      const targetSlot = item.slot !== undefined ? Number(item.slot) : slot;
+      const raw = item.buffer || item.bytes || item;
+      const buf = toArrayBuffer(raw);
+      normalizedVb[targetSlot] = item.offset ? buf.slice(item.offset) : buf;
     }
-
-    if (!rawBuf) continue;
-
-    const arrayBuf = toArrayBuffer(rawBuf);
-    const view = new DataView(arrayBuf);
-    const stepMode = layout.stepMode || "vertex";
-    const stride = layout.arrayStride || 0;
-    const itemIndex = stepMode === "instance" ? instIndex : vIndex;
-    const baseOffset = boundOffset + itemIndex * stride;
-
-    for (const at of layout.attributes) {
-      const attrOffset = baseOffset + (at.offset || 0);
-      const loc = at.shaderLocation;
-      const decoded = decodeVertexAttribute(view, attrOffset, at.format);
-      if (decoded !== undefined && decoded !== null) {
-        inputs[loc] = decoded;
-        inputs[String(loc)] = decoded;
-      }
+  } else if (vertexBufferData && typeof vertexBufferData === "object") {
+    for (const [slotKey, item] of Object.entries(vertexBufferData)) {
+      const targetSlot = Number(slotKey);
+      if (isNaN(targetSlot) || !item) continue;
+      const raw = item.buffer || item.bytes || item;
+      const buf = toArrayBuffer(raw);
+      normalizedVb[targetSlot] = item.offset ? buf.slice(item.offset) : buf;
     }
   }
 
-  return inputs;
+  const inputsArray = Array.isArray(shaderInputs) ? shaderInputs : null;
+
+  const result = upstreamFetchVertexInputs(
+    pipelineDesc,
+    normalizedVb,
+    Number(vertexIndex) || 0,
+    Number(instanceIndex) || 0,
+    inputsArray
+  );
+
+  result.vertexIndex = result.vertex_index;
+  result.instanceIndex = result.instance_index;
+  for (const [k, v] of Object.entries(result)) {
+    if (!isNaN(Number(k))) {
+      result[String(k)] = v;
+    }
+  }
+
+  if (shaderInputs && typeof shaderInputs === "object" && !Array.isArray(shaderInputs)) {
+    Object.assign(result, shaderInputs);
+  }
+
+  return result;
 }
 
 /**
@@ -619,7 +634,8 @@ export function prepareFragmentInputs(params = {}) {
     pixelX = 0,
     pixelY = 0,
     invocation = {},
-    payloadResolver = null
+    payloadResolver = null,
+    options = {}
   } = params;
 
   const objects = capture?.metadata?.objects || capture?.objects || {};
@@ -650,227 +666,167 @@ export function prepareFragmentInputs(params = {}) {
   // Default fragment inputs
   const defaultInputs = {
     position: [px + 0.5, py + 0.5, 0.5, 1.0],
-    front_facing: invocation.frontFacing ?? true,
+    front_facing: invocation.frontFacing ? 1 : 0,
     sample_index: invocation.sampleIndex ?? 0,
     sample_mask: invocation.sampleMask ?? 0xffffffff,
     ...(invocation.inputs || {}),
     ...invocation
   };
 
-  // If no pipeline or vertex stage exists, return defaults
   const pipeDesc = pipeline?.descriptor || pipeline;
-  if (!pipeDesc || !pipeDesc.vertex) {
+  if (!pipeDesc) {
     return defaultInputs;
   }
 
-  const vModuleId = refId(pipeDesc.vertex.module);
+  // Support finding vertex code from pipeDesc.vertex.module OR fallback to params.code / options.code / invocation.code
+  const vModuleId = pipeDesc.vertex?.module ? refId(pipeDesc.vertex.module) : null;
   const vShaderObj = vModuleId != null ? objects[String(vModuleId)] : null;
-  const vCode = vShaderObj?.descriptor?.code || vShaderObj?.code;
-  if (!vCode) {
+  let vCode =
+    vShaderObj?.descriptor?.code ||
+    vShaderObj?.code ||
+    params.code ||
+    options?.code ||
+    invocation?.code;
+
+  if (!vCode || typeof vCode !== "string") {
     return defaultInputs;
   }
 
-  const vEntryPoint = pipeDesc.vertex.entryPoint || "main";
-  const instanceIndex = Number(invocation.instanceIndex) || 0;
+  let vReflect;
+  try {
+    vReflect = new WgslReflect(vCode);
+  } catch {
+    return defaultInputs;
+  }
 
-  // Reconstruct index array
-  let indices = [];
+  const vEntryPoint = pipeDesc.vertex?.entryPoint;
+  let vsEntry = vEntryPoint ? vReflect.entry.vertex?.find((e) => e.name === vEntryPoint) : null;
+  if (!vsEntry && vReflect.entry.vertex?.length > 0) {
+    vsEntry = vReflect.entry.vertex[0];
+  }
+  if (!vsEntry) {
+    return defaultInputs;
+  }
+
+  const topology = pipeDesc.primitive?.topology || "triangle-list";
+  const frontFace = pipeDesc.primitive?.frontFace || "ccw";
   const method = drawCmd?.method || "draw";
   const drawArgs = drawCmd?.args || [];
 
-  if (method === "drawIndexed" || indexBuffer) {
+  let triangles = [];
+  if (method === "drawIndexed") {
+    let indexArray = null;
+    if (indexBuffer) {
+      if (indexBuffer instanceof Uint16Array || indexBuffer instanceof Uint32Array) {
+        indexArray = indexBuffer;
+      } else if (indexBuffer.buffer) {
+        const is32 = indexBuffer.format === "uint32";
+        const buf = toArrayBuffer(indexBuffer.buffer);
+        indexArray = is32 ? new Uint32Array(buf) : new Uint16Array(buf);
+      } else if (indexBuffer.bufferData) {
+        indexArray = decodeIndexArray(indexBuffer);
+      }
+    }
     const indexCount = Number(drawArgs[0]) || 0;
     const firstIndex = Number(drawArgs[2]) || 0;
     const baseVertex = Number(drawArgs[3]) || 0;
-
-    let idxBuf = indexBuffer?.buffer ? toArrayBuffer(indexBuffer.buffer) : null;
-    if (!idxBuf && indexBuffer?.bufferId != null) {
-      const bData = resolveBufferData(
-        indexBuffer.bufferId,
-        objects[String(indexBuffer.bufferId)],
-        null,
-        capture,
-        payloadResolver
-      );
-      idxBuf = toArrayBuffer(bData);
-    }
-
-    if (idxBuf && idxBuf.byteLength > 0) {
-      const view = new DataView(idxBuf);
-      const is32 = indexBuffer?.format === "uint32";
-      const stride = is32 ? 4 : 2;
-      const offset = Number(indexBuffer?.offset) || 0;
-      for (let i = 0; i < indexCount; i++) {
-        const off = offset + (firstIndex + i) * stride;
-        if (off + stride <= idxBuf.byteLength) {
-          const idx = is32 ? view.getUint32(off, true) : view.getUint16(off, true);
-          indices.push(idx + baseVertex);
-        }
-      }
-    } else {
-      for (let i = 0; i < indexCount; i++) {
-        indices.push(firstIndex + i + baseVertex);
-      }
-    }
-  } else {
-    const vertexCount = Number(drawArgs[0]) || 3;
+    triangles = assembleTriangles(topology, indexCount, indexArray, firstIndex, baseVertex);
+  } else if (method === "draw") {
+    const vertexCount = Number(drawArgs[0]) || 0;
     const firstVertex = Number(drawArgs[2]) || 0;
-    for (let i = 0; i < vertexCount; i++) {
-      indices.push(firstVertex + i);
+    triangles = assembleTriangles(topology, vertexCount, null, firstVertex, 0);
+  } else {
+    return defaultInputs;
+  }
+
+  if (!triangles || triangles.length === 0) {
+    return defaultInputs;
+  }
+
+  // Format vertex buffer data for makeVertexRunner
+  const vbDataArray = [];
+  if (Array.isArray(vertexBuffers)) {
+    for (let slot = 0; slot < vertexBuffers.length; slot++) {
+      const vb = vertexBuffers[slot];
+      if (!vb) continue;
+      const slotIdx = vb.slot !== undefined ? Number(vb.slot) : slot;
+      let raw = vb.buffer || vb.bytes || vb;
+      let arrayBuf = toArrayBuffer(raw);
+      if (vb.offset) {
+        arrayBuf = arrayBuf.slice(vb.offset);
+      }
+      vbDataArray[slotIdx] = arrayBuf;
+    }
+  } else if (vertexBuffers && typeof vertexBuffers === "object") {
+    for (const [slotKey, vb] of Object.entries(vertexBuffers)) {
+      const slotIdx = Number(slotKey);
+      if (isNaN(slotIdx) || !vb) continue;
+      let raw = vb.buffer || vb.bytes || vb;
+      let arrayBuf = toArrayBuffer(raw);
+      if (vb.offset) {
+        arrayBuf = arrayBuf.slice(vb.offset);
+      }
+      vbDataArray[slotIdx] = arrayBuf;
     }
   }
 
   // Build vertex bind groups
   const vBindGroups = buildSessionBindGroups(capture, params.bindGroups || [], payloadResolver);
 
-  // Execute vertex shader for all vertices
-  const vertexCache = new Map();
-  const vReflect = new WgslReflect(vCode);
-  const vFnInfo = vReflect.getFunctionInfo(vEntryPoint);
+  const instanceIndex = Number(invocation.instanceIndex ?? invocation.instance_index ?? (drawArgs[3] || 0));
 
-  for (const vIdx of indices) {
-    if (vertexCache.has(vIdx)) continue;
-    const vInputs = fetchVertexInputs(pipeDesc, vertexBuffers, vIdx, instanceIndex);
-    const vDebug = new WgslDebug(vCode);
-    const ok = vDebug.debugVertex(vEntryPoint, vInputs, vBindGroups);
-    if (!ok) continue;
-
-    while (vDebug.stepNext(true)) {}
-    const ret = vDebug.getReturnValue();
-    if (!ret) continue;
-
-    let pos = ret.position || ret.pos || ret["@position"] || [0, 0, 0, 1];
-    if (!Array.isArray(pos) && pos?.data) {
-      pos = Array.from(pos.data);
-    }
-    if (Array.isArray(pos) && pos.length === 2) {
-      pos = [pos[0], pos[1], 0.0, 1.0];
-    } else if (Array.isArray(pos) && pos.length === 3) {
-      pos = [pos[0], pos[1], pos[2], 1.0];
-    }
-
-    // Map vertex output member locations if struct return
-    const varyings = { ...ret };
-    if (vFnInfo?.returnType?.members) {
-      for (const m of vFnInfo.returnType.members) {
-        const locAttr = m.attributes?.find((a) => a.name === "location");
-        if (locAttr && locAttr.value !== undefined && ret[m.name] !== undefined) {
-          const loc = Number(locAttr.value);
-          varyings[loc] = ret[m.name];
-          varyings[String(loc)] = ret[m.name];
-        }
-      }
-    }
-
-    vertexCache.set(vIdx, { position: pos, varyings });
+  let runVertex;
+  try {
+    runVertex = makeVertexRunner({
+      code: vCode,
+      entryName: vsEntry.name,
+      entryInputs: vsEntry.inputs,
+      entryOutputs: vsEntry.outputs,
+      pipelineDesc: pipeDesc,
+      vertexBufferData: vbDataArray,
+      bindGroups: vBindGroups,
+      constants: pipeDesc.vertex?.constants
+    });
+  } catch (err) {
+    return defaultInputs;
   }
 
-  // Build primitives triangles
-  const topology = pipeDesc.primitive?.topology || "triangle-list";
-  const frontFace = pipeDesc.primitive?.frontFace || "ccw";
-  const cullMode = pipeDesc.primitive?.cullMode || "none";
+  const getVertex = (vertexIndex) => runVertex(vertexIndex, instanceIndex);
+  const primitive = Number(invocation.primitiveIndex ?? invocation.primitive ?? -1);
 
-  const triangles = [];
-  if (topology === "triangle-strip") {
-    for (let i = 0; i + 2 < indices.length; i++) {
-      if (i % 2 === 0) {
-        triangles.push([indices[i], indices[i + 1], indices[i + 2]]);
-      } else {
-        triangles.push([indices[i + 1], indices[i], indices[i + 2]]);
-      }
-    }
-  } else {
-    // triangle-list
-    for (let i = 0; i + 2 < indices.length; i += 3) {
-      triangles.push([indices[i], indices[i + 1], indices[i + 2]]);
+  const quad = buildFragmentQuad(
+    triangles,
+    getVertex,
+    targetWidth,
+    targetHeight,
+    Math.floor(px),
+    Math.floor(py),
+    frontFace,
+    primitive
+  );
+
+  if (!quad) {
+    return defaultInputs;
+  }
+
+  const targetLane = quad.targetLane;
+  const targetLaneInputs = quad.quadInputs[targetLane];
+
+  const combined = {
+    ...targetLaneInputs,
+    quadInputs: quad.quadInputs,
+    targetLane: quad.targetLane,
+    triangle: quad.triangle,
+    inputs: targetLaneInputs
+  };
+
+  for (const o of vsEntry.outputs || []) {
+    if (o.locationType === "location" && targetLaneInputs[o.location] !== undefined) {
+      combined[o.name] = targetLaneInputs[o.location];
     }
   }
 
-  const Px = px + 0.5;
-  const Py = py + 0.5;
-
-  for (const [i0, i1, i2] of triangles) {
-    const v0 = vertexCache.get(i0);
-    const v1 = vertexCache.get(i1);
-    const v2 = vertexCache.get(i2);
-    if (!v0 || !v1 || !v2) continue;
-
-    const p0 = v0.position;
-    const p1 = v1.position;
-    const p2 = v2.position;
-
-    const w0 = p0[3] || 1.0;
-    const w1 = p1[3] || 1.0;
-    const w2 = p2[3] || 1.0;
-
-    const x0_ndc = p0[0] / w0;
-    const y0_ndc = p0[1] / w0;
-    const z0_ndc = p0[2] / w0;
-
-    const x1_ndc = p1[0] / w1;
-    const y1_ndc = p1[1] / w1;
-    const z1_ndc = p1[2] / w1;
-
-    const x2_ndc = p2[0] / w2;
-    const y2_ndc = p2[1] / w2;
-    const z2_ndc = p2[2] / w2;
-
-    const sx0 = (x0_ndc + 1) * 0.5 * targetWidth;
-    const sy0 = (1 - y0_ndc) * 0.5 * targetHeight;
-
-    const sx1 = (x1_ndc + 1) * 0.5 * targetWidth;
-    const sy1 = (1 - y1_ndc) * 0.5 * targetHeight;
-
-    const sx2 = (x2_ndc + 1) * 0.5 * targetWidth;
-    const sy2 = (1 - y2_ndc) * 0.5 * targetHeight;
-
-    const det = (sy1 - sy2) * (sx0 - sx2) + (sx2 - sx1) * (sy0 - sy2);
-    if (Math.abs(det) < 1e-8) continue;
-
-    const l0 = ((sy1 - sy2) * (Px - sx2) + (sx2 - sx1) * (Py - sy2)) / det;
-    const l1 = ((sy2 - sy0) * (Px - sx2) + (sx0 - sx2) * (Py - sy2)) / det;
-    const l2 = 1.0 - l0 - l1;
-
-    const eps = -1e-4;
-    if (l0 >= eps && l1 >= eps && l2 >= eps) {
-      const area = (sx1 - sx0) * (sy2 - sy0) - (sy1 - sy0) * (sx2 - sx0);
-      const isCcw = frontFace === "ccw";
-      const isFront = isCcw ? area < 0 : area > 0;
-
-      if (cullMode === "back" && !isFront) continue;
-      if (cullMode === "front" && isFront) continue;
-
-      const invW = l0 / w0 + l1 / w1 + l2 / w2;
-      const wP = 1.0 / invW;
-      const zP = (l0 * z0_ndc / w0 + l1 * z1_ndc / w1 + l2 * z2_ndc / w2) * wP;
-
-      const resultInputs = {
-        position: [Px, Py, zP, invW],
-        front_facing: isFront,
-        sample_index: 0,
-        sample_mask: 0xffffffff
-      };
-
-      for (const key of Object.keys(v0.varyings)) {
-        if (key === "pos" || key === "position" || key === "@position") continue;
-        const val0 = v0.varyings[key];
-        const val1 = v1.varyings[key];
-        const val2 = v2.varyings[key];
-
-        if (typeof val0 === "number") {
-          resultInputs[key] = (l0 * val0 / w0 + l1 * (val1 ?? 0) / w1 + l2 * (val2 ?? 0) / w2) * wP;
-        } else if (Array.isArray(val0)) {
-          resultInputs[key] = val0.map(
-            (c, idx) => (l0 * c / w0 + l1 * (val1?.[idx] ?? 0) / w1 + l2 * (val2?.[idx] ?? 0) / w2) * wP
-          );
-        }
-      }
-
-      return Object.assign(resultInputs, invocation.inputs || {});
-    }
-  }
-
-  return defaultInputs;
+  return Object.assign(combined, invocation.inputs || {});
 }
 
 /**
@@ -880,6 +836,11 @@ export function prepareFragmentInputs(params = {}) {
  * @returns {[Object, Object, Object, Object]} 4 quad lane inputs
  */
 export function buildFragmentQuadInputs(params = {}) {
+  const result = prepareFragmentInputs(params);
+  if (result?.quadInputs && Array.isArray(result.quadInputs) && result.quadInputs.length === 4) {
+    return result.quadInputs;
+  }
+
   const baseX = Number(params.invocation?.pixelX ?? params.invocation?.x ?? params.pixelX) || 0;
   const baseY = Number(params.invocation?.pixelY ?? params.invocation?.y ?? params.pixelY) || 0;
 
@@ -953,7 +914,8 @@ export function resolvePassState(capture, targetIndex) {
           commandIndex: i,
           group: slot,
           bindGroupId: refId(c.args?.[1]),
-          dynamicOffsets: c.args?.[2] || []
+          dynamicOffsets: c.args?.[2] || [],
+          bufferData: c.bufferData
         };
       }
     } else if (c.method === "setVertexBuffer") {
@@ -1191,6 +1153,7 @@ export function prepareShaderDebugSession(params = {}) {
         const defaultBuf = new ArrayBuffer(65536);
         sessionBindGroups[s.group][s.binding] = {
           storage: defaultBuf,
+          uniform: defaultBuf,
           buffer: defaultBuf
         };
       }
@@ -1203,6 +1166,7 @@ export function prepareShaderDebugSession(params = {}) {
         const defaultBuf = new ArrayBuffer(1024);
         sessionBindGroups[u.group][u.binding] = {
           uniform: defaultBuf,
+          storage: defaultBuf,
           buffer: defaultBuf
         };
       }
@@ -1352,7 +1316,9 @@ export function prepareShaderDebugSession(params = {}) {
       pixelX: invocation.pixelX ?? invocation.x ?? 0,
       pixelY: invocation.pixelY ?? invocation.y ?? 0,
       invocation,
-      payloadResolver
+      payloadResolver,
+      code,
+      options
     });
 
     sessionInvocation = {
@@ -1361,6 +1327,10 @@ export function prepareShaderDebugSession(params = {}) {
       inputs: fragmentInputs
     };
     stageConfig.inputs = fragmentInputs;
+    if (fragmentInputs.quadInputs) {
+      stageConfig.quadInputs = fragmentInputs.quadInputs;
+      stageConfig.targetLane = fragmentInputs.targetLane;
+    }
   }
 
   // 7. Instantiate and initialize session
