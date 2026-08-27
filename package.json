@@ -1,0 +1,24 @@
+{
+  "name": "webgpu-inspector-mcp",
+  "version": "1.0.0",
+  "description": "OpenCode MCP server for WebGPU Inspector",
+  "type": "module",
+  "main": "index.js",
+  "bin": {
+    "webgpu-inspector-mcp": "./index.js"
+  },
+  "scripts": {
+    "start": "node index.js"
+  },
+  "keywords": [
+    "webgpu",
+    "webgpu-inspector",
+    "mcp",
+    "opencode"
+  ],
+  "author": "Brendan Duncan",
+  "license": "MIT",
+  "dependencies": {
+    "webgpu_inspector": "github:brendan-duncan/webgpu_inspector#f9c73368637bb2b0bff5faaa00ff28981eb2c3fa"
+  }
+}
