@@ -46,7 +46,7 @@ The WebGPU Inspector MCP server connects OpenCode to running WebGPU applications
 | `get_validation_errors` | Returns all WebGPU validation errors recorded during capture | `captureId` |
 | `read_buffer` | Reads and decodes live GPU buffer contents without full capture | `bufferId`, `type` (`float32`, `uint32`, `hex`, etc.), `offset`, `size` |
 | `read_texture` | Reads live GPU texture/render-target region (min/max/mean, hole texels, ASCII view) | `textureId`, `mipLevel`, `x`, `y`, `width`, `height` |
-| `shader_debug_start` | Starts an interactive WGSL shader debugging session (compute/vertex/fragment) | `commandIndex`, `stage`, `invocation`, `captureId`, `breakpoints`, `code` |
+| `shader_debug_start` | Starts an interactive WGSL shader debugging session (compute/vertex/fragment) | `commandIndex`, `stage`, `invocation`, `captureId`, `breakpoints`, `code`, `shaderCaptureId`, `shaderObjectId` |
 | `shader_debug_step` | Steps through shader execution (`step_next`, `step_over`, `step_into`, `step_out`) | `sessionId`, `action`, `count` |
 | `shader_debug_continue` | Resumes execution until breakpoint or shader completion | `sessionId`, `maxSteps` |
 | `shader_debug_set_breakpoints` | Sets, removes, or clears line breakpoints | `sessionId`, `add`, `remove`, `clearAll` |

@@ -44,7 +44,7 @@ The server provides 8 dedicated tools for interactive shader debugging powered b
 
 | Tool | Description | Key Parameters |
 | --- | --- | --- |
-| `shader_debug_start` | Starts an interactive debugging session for a compute dispatch, vertex draw, or fragment pixel. | `captureId`, `commandIndex`, `stage` (`"compute"`, `"vertex"`, `"fragment"`), `entryPoint`, `code`, `invocation`, `breakpoints`, `constants`, `sessionId` |
+| `shader_debug_start` | Starts an interactive debugging session for a compute dispatch, vertex draw, or fragment pixel. | `captureId`, `commandIndex`, `stage` (`"compute"`, `"vertex"`, `"fragment"`), `entryPoint`, `code`, `shaderCaptureId`, `shaderObjectId`, `invocation`, `breakpoints`, `constants`, `sessionId` |
 | `shader_debug_step` | Advances shader execution by stepping lines or instructions. | `sessionId`, `action` (`"step_next"`, `"step_into"`, `"step_over"`, `"step_out"`), `count` |
 | `shader_debug_continue` | Continues execution until a line breakpoint is hit, the shader finishes, or `maxSteps` is reached. | `sessionId`, `maxSteps` (default: 50000) |
 | `shader_debug_set_breakpoints` | Sets, removes, or clears line breakpoints in the active session. | `sessionId`, `add` (array of line numbers), `remove` (array of line numbers), `clearAll` (boolean) |

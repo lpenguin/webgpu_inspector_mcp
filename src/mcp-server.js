@@ -724,6 +724,16 @@ export function createMcpServer(deps = {}) {
             type: "string",
             description: "Optional explicit WGSL source code override."
           },
+          shaderCaptureId: {
+            type: "string",
+            description:
+              "Optional capture ID to pull shader source code from (if referencing a shader from another capture)."
+          },
+          shaderObjectId: {
+            type: "integer",
+            description:
+              "Optional numeric ShaderModule object ID to pull WGSL source code from (resolved from shaderCaptureId, or the primary capture if shaderCaptureId is omitted)."
+          },
           invocation: {
             type: "object",
             description:
@@ -1171,13 +1181,45 @@ export function createMcpServer(deps = {}) {
       const payloadResolver = (payloadId) =>
         store?.getPayload ? store.getPayload(captureId, payloadId) : null;
 
+      let code = args.code;
+      if (!code && (args.shaderObjectId !== undefined || args.shaderCaptureId !== undefined)) {
+        if (args.shaderObjectId === undefined) {
+          throw new Error("shaderObjectId is required when shaderCaptureId is specified.");
+        }
+        let targetJson = captureJson;
+        if (args.shaderCaptureId) {
+          targetJson = store?.getJson ? store.getJson(args.shaderCaptureId) : null;
+          if (!targetJson) {
+            throw new Error(
+              `No capture "${args.shaderCaptureId}". Use list_captures to see what is available.`
+            );
+          }
+        }
+        let shader = getShader(targetJson, Number(args.shaderObjectId));
+        if (shader?.error && targetJson.metadata?.objects) {
+          shader = getShader(
+            { objects: targetJson.metadata.objects },
+            Number(args.shaderObjectId)
+          );
+        }
+        if (shader?.error) {
+          throw new Error(shader.error);
+        }
+        code = shader?.code;
+        if (!code || typeof code !== "string" || !code.trim()) {
+          throw new Error(
+            `Shader module #${args.shaderObjectId} contains no WGSL code`
+          );
+        }
+      }
+
       const session = prepareShaderDebugSession({
         capture: captureJson,
         commandIndex:
           args.commandIndex !== undefined ? Number(args.commandIndex) : undefined,
         stage: args.stage,
         entryPoint: args.entryPoint,
-        code: args.code,
+        code,
         invocation: args.invocation || {},
         payloadResolver,
         options: {

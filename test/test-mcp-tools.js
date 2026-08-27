@@ -604,6 +604,269 @@ test("Validation against real WoodWorks capture file (if present on filesystem)"
 });
 
 // ---------------------------------------------------------------------------
+// 11. Referencing shaders across captures and by object ID
+// ---------------------------------------------------------------------------
+test("shader_debug_start references shader code from another capture via shaderCaptureId and shaderObjectId", async () => {
+  const harness = await createTestClient();
+  try {
+    // Capture A: contains ShaderModule #10 with WGSL compute code
+    const shaderCode = `
+      struct Params {
+        multiplier: f32,
+      };
+      @group(0) @binding(0) var<uniform> params: Params;
+      @group(0) @binding(1) var<storage, read_write> outBuffer: array<f32>;
+
+      @compute @workgroup_size(1)
+      fn cross_compute(@builtin(global_invocation_id) gid: vec3u) {
+        let idx = gid.x;
+        outBuffer[idx] = f32(idx) * params.multiplier + 10.0;
+      }
+    `;
+
+    const captureA = {
+      metadata: {
+        frame: 1,
+        commands: [],
+        objects: {
+          "10": {
+            id: 10,
+            type: "ShaderModule",
+            label: "external_compute_module",
+            descriptor: { code: shaderCode }
+          }
+        }
+      }
+    };
+
+    // Capture B: contains pipeline without shader source in its objects, but has uniform & storage buffers
+    const uniformBuf = new ArrayBuffer(16);
+    new Float32Array(uniformBuf)[0] = 3.5;
+    const storageBuf = new ArrayBuffer(64);
+
+    const captureB = {
+      metadata: {
+        frame: 2,
+        commands: [
+          { method: "beginComputePass", object: "GPUCommandEncoder#1", args: [{ label: "compute_pass" }], result: "GPUComputePassEncoder#1" },
+          { method: "setPipeline", object: "GPUComputePassEncoder#1", args: [{ __id: 20 }] },
+          { method: "setBindGroup", object: "GPUComputePassEncoder#1", args: [0, { __id: 25 }] },
+          { method: "dispatchWorkgroups", object: "GPUComputePassEncoder#1", args: [4, 1, 1] },
+          { method: "end", object: "GPUComputePassEncoder#1", args: [] }
+        ],
+        objects: {
+          "20": {
+            id: 20,
+            type: "ComputePipeline",
+            label: "target_pipeline",
+            descriptor: {
+              compute: { module: { __id: 10 }, entryPoint: "cross_compute" }
+            }
+          },
+          "23": {
+            id: 23,
+            type: "Buffer",
+            label: "params_uniform",
+            size: 16,
+            initialData: uniformBuf
+          },
+          "24": {
+            id: 24,
+            type: "Buffer",
+            label: "output_storage",
+            size: 64,
+            initialData: storageBuf
+          },
+          "25": {
+            id: 25,
+            type: "BindGroup",
+            label: "target_bind_group",
+            descriptor: {
+              entries: [
+                { binding: 0, resource: { buffer: { __id: 23 }, offset: 0, size: 16 } },
+                { binding: 1, resource: { buffer: { __id: 24 }, offset: 0, size: 64 } }
+              ]
+            }
+          }
+        }
+      }
+    };
+
+    const metaA = await harness.loadSyntheticCapture(captureA, { label: "capture-a" });
+    const metaB = await harness.loadSyntheticCapture(captureB, { label: "capture-b" });
+
+    // Start debug session on capture B referencing shader module #10 from capture A
+    const session = await harness.callToolJson("shader_debug_start", {
+      captureId: metaB.id,
+      shaderCaptureId: metaA.id,
+      shaderObjectId: 10,
+      commandIndex: 3,
+      invocation: { threadId: [1, 0, 0] }
+    });
+
+    assert.equal(session.captureId, metaB.id);
+    assert.equal(session.stage, "compute");
+    assert.equal(session.entryPoint, "cross_compute");
+    assert.equal(session.status, "paused");
+
+    // Step through execution
+    const stepRes = await harness.callToolJson("shader_debug_step", {
+      sessionId: session.sessionId,
+      action: "step_next",
+      count: 1
+    });
+    assert.equal(stepRes.status, "paused");
+
+    // Inspect variables
+    const vars = await harness.callToolJson("shader_debug_get_variables", {
+      sessionId: session.sessionId,
+      scope: "globals"
+    });
+    assert(vars.globals.params, "params uniform buffer must be resolved in globals");
+
+    // Evaluate expression
+    const evalRes = await harness.callToolJson("shader_debug_eval", {
+      sessionId: session.sessionId,
+      expression: "params.multiplier"
+    });
+    assert.equal(evalRes.success, true);
+    assert.equal(evalRes.value, 3.5);
+
+    await harness.callToolJson("shader_debug_stop", { sessionId: session.sessionId });
+  } finally {
+    await harness.close();
+  }
+});
+
+test("shader_debug_start references shaderObjectId within same capture", async () => {
+  const harness = await createTestClient();
+  try {
+    const computeCap = createComputeCapture();
+    const meta = await harness.loadSyntheticCapture(computeCap);
+
+    // Call shader_debug_start referencing shaderObjectId: 1 without passing code or shaderCaptureId
+    const session = await harness.callToolJson("shader_debug_start", {
+      captureId: meta.id,
+      shaderObjectId: 1,
+      commandIndex: 5,
+      invocation: { threadId: [0, 0, 0] }
+    });
+
+    assert.equal(session.captureId, meta.id);
+    assert.equal(session.stage, "compute");
+    assert.equal(session.entryPoint, "comp_main");
+    assert.equal(session.status, "paused");
+
+    const stepRes = await harness.callToolJson("shader_debug_step", {
+      sessionId: session.sessionId,
+      action: "step_next",
+      count: 2
+    });
+    assert.equal(stepRes.status, "paused");
+
+    await harness.callToolJson("shader_debug_stop", { sessionId: session.sessionId });
+  } finally {
+    await harness.close();
+  }
+});
+
+test("shader_debug_start error handling for shaderCaptureId and shaderObjectId", async () => {
+  const harness = await createTestClient();
+  try {
+    const computeCap = createComputeCapture();
+    const meta = await harness.loadSyntheticCapture(computeCap);
+
+    // 1. Non-existent shaderCaptureId
+    await assert.rejects(
+      async () => {
+        await harness.callToolJson("shader_debug_start", {
+          captureId: meta.id,
+          shaderCaptureId: "non-existent-cap-999",
+          shaderObjectId: 1
+        });
+      },
+      (err) => err.message.includes('No capture "non-existent-cap-999"')
+    );
+
+    // 2. Non-existent shaderObjectId
+    await assert.rejects(
+      async () => {
+        await harness.callToolJson("shader_debug_start", {
+          captureId: meta.id,
+          shaderObjectId: 9999
+        });
+      },
+      (err) => err.message.includes("No object #9999 in capture")
+    );
+
+    // 3. shaderCaptureId specified without shaderObjectId
+    await assert.rejects(
+      async () => {
+        await harness.callToolJson("shader_debug_start", {
+          captureId: meta.id,
+          shaderCaptureId: meta.id
+        });
+      },
+      (err) => err.message.includes("shaderObjectId is required when shaderCaptureId is specified")
+    );
+
+    // 4. shaderObjectId pointing to a Buffer (not a ShaderModule)
+    await assert.rejects(
+      async () => {
+        await harness.callToolJson("shader_debug_start", {
+          captureId: meta.id,
+          shaderObjectId: 3
+        });
+      },
+      (err) => err.message.includes("Object #3 is a Buffer, not a ShaderModule")
+    );
+
+    // 5. shaderObjectId pointing to ShaderModule with empty code
+    const emptyShaderCap = {
+      metadata: {
+        frame: 1,
+        commands: [],
+        objects: {
+          "1": {
+            id: 1,
+            type: "ShaderModule",
+            label: "empty_shader",
+            descriptor: { code: "" }
+          }
+        }
+      }
+    };
+    const metaEmpty = await harness.loadSyntheticCapture(emptyShaderCap);
+    await assert.rejects(
+      async () => {
+        await harness.callToolJson("shader_debug_start", {
+          captureId: metaEmpty.id,
+          shaderObjectId: 1
+        });
+      },
+      (err) => err.message.includes("Shader module #1 contains no WGSL code")
+    );
+
+    // 6. Explicit 'code' override takes precedence over shaderObjectId
+    const overrideCode = `
+      @compute @workgroup_size(1)
+      fn override_main(@builtin(global_invocation_id) gid: vec3u) {}
+    `;
+    const sessionOverride = await harness.callToolJson("shader_debug_start", {
+      captureId: meta.id,
+      code: overrideCode,
+      shaderObjectId: 9999, // Should be ignored because 'code' is provided
+      commandIndex: 5,
+      invocation: { threadId: [0, 0, 0] }
+    });
+    assert.equal(sessionOverride.entryPoint, "override_main");
+    await harness.callToolJson("shader_debug_stop", { sessionId: sessionOverride.sessionId });
+  } finally {
+    await harness.close();
+  }
+});
+
+// ---------------------------------------------------------------------------
 // Test Runner
 // ---------------------------------------------------------------------------
 async function runAll() {
